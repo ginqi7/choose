@@ -22,12 +22,23 @@ static BOOL VisualizeWhitespaceCharacters;
 static BOOL AllowEmptyInput;
 static BOOL MatchFromBeginning;
 static BOOL ScoreFirstMatchedPosition;
+static BOOL AutoSelectSingleChoice;
+static BOOL MatchWords;
+static BOOL SortMatches;
 static BOOL Password;
 
 static NSString* LastQueryString;
 static int LastCursorPos;
 static NSString* ScriptAtInput;
 static NSString* ScriptAtList;
+
+typedef NS_ENUM(NSInteger, CaseSpecification) {
+    SENSITIVE,
+    INSENSITIVE,
+    SMART
+};
+
+static CaseSpecification SearchCase;
 
 /******************************************************************************/
 /* Boilerplate Subclasses                                                     */
@@ -68,12 +79,11 @@ static NSString* ScriptAtList;
 
 @interface SDChoice : NSObject
 
-@property NSString* normalized;
 @property NSString* raw;
 @property NSMutableIndexSet* indexSet;
 @property NSMutableAttributedString* displayString;
 
-@property BOOL hasAllCharacters;
+@property BOOL isMatchForQuery;
 @property int score;
 
 @end
@@ -83,7 +93,6 @@ static NSString* ScriptAtList;
 - (id) initWithString:(NSString*)str {
     if (self = [super init]) {
         self.raw = str;
-        self.normalized = [self.raw lowercaseString];
         self.indexSet = [NSMutableIndexSet indexSet];
 
         NSString* displayStringRaw = self.raw;
@@ -105,7 +114,7 @@ static NSString* ScriptAtList;
 #endif
 
 
-    NSUInteger len = [self.normalized length];
+    NSUInteger len = [self.raw length];
     NSRange fullRange = NSMakeRange(0, len);
 
     [self.displayString removeAttribute:NSForegroundColorAttributeName range:fullRange];
@@ -130,78 +139,72 @@ static NSString* ScriptAtList;
     }];
 }
 
-- (void) analyze:(NSString*)query {
+- (void) matchAgainstQuery: (NSArray*) queryTokens
+                            isCaseSensitive: (BOOL) isCaseSensitive
+{
+    // given a query split into queryTokens (either characters or words
+    // depending on user options), find if this choice matches the query and
+    // update self.isMatchForQuery and self.indexSet accordingly.
 
-    // TODO: might not need this variable?
-    self.hasAllCharacters = NO;
+    NSString* text = self.raw;
+    int len = [text length];
 
-    [self.indexSet removeAllIndexes];
-    BOOL foundAll = YES;
-    __block int firstOccurenceScore = 0;
-
-    if (MatchFromBeginning) {
-        NSUInteger firstPos = 0;
-        for (NSInteger i = 0; i < [query length]; i++) {
-            unichar qc = [query characterAtIndex: i];
-            BOOL found = NO;
-            for (NSInteger i = firstPos; i <= [self.normalized length] - 1; i++) {
-                unichar rc = [self.normalized characterAtIndex: i];
-                if (qc == rc) {
-                    if (firstPos == 0) {
-                        firstOccurenceScore = -i;
-                    }
-                    [self.indexSet addIndex: i];
-                    firstPos = i+1;
-                    found = YES;
-                    break;
-                }
-            }
-            if (!found) {
-                foundAll = NO;
-                break;
-            }
-        }
+    NSStringCompareOptions options = 0;
+    if ( ! MatchFromBeginning ) {
+        options |= NSBackwardsSearch;
+    }
+    if ( isCaseSensitive ) {
+        options |= NSLiteralSearch;
     } else {
-        NSUInteger lastPos = [self.normalized length] - 1;
+        options |= NSCaseInsensitiveSearch;
+    }
 
-        for (NSInteger i = [query length] - 1; i >= 0; i--) {
-            unichar qc = [query characterAtIndex: i];
-            BOOL found = NO;
-            for (NSInteger i = lastPos; i >= 0; i--) {
-                unichar rc = [self.normalized characterAtIndex: i];
-                if (qc == rc) {
-                    if (lastPos == [self.normalized length] - 1) {
-                        firstOccurenceScore = i - [self.normalized length] + 1;
-                    }
-                    [self.indexSet addIndex: i];
-                    lastPos = i-1;
-                    found = YES;
-                    break;
-                }
-            }
-            if (!found) {
-                foundAll = NO;
-                break;
-            }
+    int nextIdx = MatchFromBeginning ? 0 : (len - 1);
+    self.isMatchForQuery = YES;
+    [self.indexSet removeAllIndexes];
+    for (NSString* token in queryTokens) {
+        if ( (nextIdx < 0) || (nextIdx >= len) ) {
+            self.isMatchForQuery = NO;
+            break;
+        }
+        NSRange searchRange;
+        if ( MatchFromBeginning ) {
+            searchRange = NSMakeRange(nextIdx, len - nextIdx);
+        } else {
+            searchRange = NSMakeRange(0, nextIdx + 1);
+        }
+        NSRange foundRange = [ text rangeOfString:token options:options 
+                               range:searchRange ];
+        if (foundRange.location == NSNotFound) {
+            self.isMatchForQuery = NO;
+            break;
+        }
+        [self.indexSet addIndexesInRange:foundRange];
+        if ( MatchFromBeginning ) {
+            nextIdx = NSMaxRange(foundRange);
+        } else {
+            nextIdx = foundRange.location - 1;
         }
     }
+}
 
-    if (!ScoreFirstMatchedPosition) {
-        firstOccurenceScore = 0;
+- (void) scoreMatch {
+
+    if (    ( ! self.isMatchForQuery ) 
+         || ( ! SortMatches )
+         || ( [self.indexSet count] == 0 ) ) {
+        self.score = 0;
+        return;
     }
 
-    self.hasAllCharacters = foundAll;
-
-    // skip the rest when it won't be used by the caller
-    if (!self.hasAllCharacters)
-        return;
-
-    // update score
-
-    self.score = 0;
-
-    if ([self.indexSet count] == 0)
-        return;
+    int firstOccurenceScore = 0;
+    if ( ScoreFirstMatchedPosition ) {
+        if (MatchFromBeginning)
+            firstOccurenceScore = -self.indexSet.firstIndex;
+        else
+            firstOccurenceScore =   self.indexSet.lastIndex 
+                                  - [self.raw length] + 1;
+    }
 
     __block int lengthScore = 0;
     __block int numRanges = 0;
@@ -213,9 +216,16 @@ static NSString* ScriptAtList;
 
     lengthScore /= numRanges;
 
-    int percentScore = ((double)[self.indexSet count] / (double)[self.normalized length]) * 100.0;
+    int percentScore = ( (double)[self.indexSet count] / 
+                         (double)[self.raw length] ) * 100.0;
 
     self.score = lengthScore + percentScore + firstOccurenceScore;
+}
+
+- (void) analyze: (NSArray*) queryTokens
+                  isCaseSensitive: (BOOL) isCaseSensitive {
+    [ self matchAgainstQuery: queryTokens isCaseSensitive: isCaseSensitive ];
+    [ self scoreMatch ];
 }
 
 @end
@@ -327,6 +337,11 @@ static NSString* ScriptAtList;
     }
 }
 
+
+- (void) setCursorAtEndOfQueryField {
+    [[self.queryField currentEditor] setSelectedRange: NSMakeRange(self.queryField.stringValue.length, 0)];
+}
+
 - (void) setupQueryField:(NSRect)textRect {
     NSRect iconRect, space;
     NSDivideRect(textRect, &iconRect, &textRect, NSHeight(textRect) / 1.25, NSMinXEdge);
@@ -357,6 +372,10 @@ static NSString* ScriptAtList;
     [self.queryField setAction: @selector(choose:)];
     [[self.queryField cell] setSendsActionOnEndEditing: NO];
     [[self.window contentView] addSubview: self.queryField];
+
+    // schedule to set cursor position after a delay, after the main run loop
+    // has completed its initial cycle
+    [self performSelector:@selector(setCursorAtEndOfQueryField) withObject:nil afterDelay:0.0];
 }
 
 - (void) getFrameForWindow:(NSRect*)winRect queryField:(NSRect*)textRect divider:(NSRect*)dividerRect tableView:(NSRect*)listRect {
@@ -539,29 +558,155 @@ static NSString* ScriptAtList;
 /* Filtering!                                                                 */
 /******************************************************************************/
 
+- (NSArray*) tokenizeQuery: (NSString*) query {
+
+    NSMutableArray* mtokens = [NSMutableArray array];
+
+    int len = [query length];
+    int nextIdx = MatchFromBeginning ? 0 : (len - 1);
+    while ( (nextIdx >= 0) && (nextIdx < len) ) {
+
+        // get the next token if one exists
+            // if it exists, append it to mtokens
+        // update nextIdx
+
+        NSString* nextToken;
+
+        if ( ! MatchWords ) {
+            // next token = just the current character
+            nextToken = [query substringWithRange: NSMakeRange(nextIdx, 1)];
+            [mtokens addObject:nextToken];
+            nextIdx += MatchFromBeginning ? 1 : -1;
+            continue;
+        }
+        
+        // next token = next word that starts at the current character
+            // if there is one!
+
+        NSCharacterSet *whitespace = [NSCharacterSet whitespaceCharacterSet];
+        NSCharacterSet *nonWhitespace = [whitespace invertedSet];
+    
+        // starting from nextIdx and going in the right direction, look for a 
+        // non-whitespace character to begin our word
+
+        NSStringCompareOptions options;
+        NSRange nonWSSearchRange;
+        if ( MatchFromBeginning ) {
+            options = 0;
+            nonWSSearchRange = NSMakeRange(nextIdx, len - nextIdx);
+        } else {
+            options = NSBackwardsSearch;
+            nonWSSearchRange = NSMakeRange(0, nextIdx + 1);
+        }
+
+        NSRange nonWSFoundRange = [ 
+            query rangeOfCharacterFromSet:nonWhitespace options:options 
+            range:nonWSSearchRange ];
+
+        if (nonWSFoundRange.location == NSNotFound) {
+            // there's no next token; we're done!
+            break;
+        }
+        
+        // there is a next token; it starts at the non-whitespace character we
+        // just found
+
+        int nonWSIdx = nonWSFoundRange.location;
+        
+        // now start at the character that immediately follows this 
+        // non-whitespace character. Look for a subsequent whitespace 
+        // character; if found, this will mark the end of our word. If not, our
+        // word continues until the end of the query.
+
+        NSRange wsSearchRange;
+        if ( MatchFromBeginning ) {
+            wsSearchRange = NSMakeRange(nonWSIdx + 1, len - nonWSIdx - 1);
+        } else {
+            wsSearchRange = NSMakeRange(0, nonWSIdx);
+        }
+
+        NSRange wsFoundRange = [ 
+            query rangeOfCharacterFromSet:whitespace options:options 
+            range:wsSearchRange ];
+
+        int wsIdx;
+        if (wsFoundRange.location == NSNotFound) {
+            wsIdx = MatchFromBeginning ? len : -1;
+        } else {
+            wsIdx = wsFoundRange.location;
+        }
+
+        int nextTokenStartIdx = nonWSIdx;
+        int nextTokenEndIdx = wsIdx - (MatchFromBeginning ? 1 : -1);
+        if ( ! MatchFromBeginning ) {
+            int temp = nextTokenStartIdx;
+            nextTokenStartIdx = nextTokenEndIdx;
+            nextTokenEndIdx = temp;
+        }
+
+        int nextTokenLength = nextTokenEndIdx - nextTokenStartIdx + 1;
+        nextToken = [ query substringWithRange: NSMakeRange(
+                          nextTokenStartIdx, nextTokenLength) ];
+
+        [mtokens addObject:nextToken];
+        if (MatchFromBeginning) {
+            nextIdx = nextTokenEndIdx + 1;
+        } else {
+            nextIdx = nextTokenStartIdx - 1;
+        }
+
+    }
+
+    return [mtokens copy];
+}
+
+- (BOOL) getIsCaseSensitive: (NSString*) query {
+    if ( SearchCase == INSENSITIVE ) {
+        return NO;
+    } else if (SearchCase == SENSITIVE) {
+        return YES;
+    } else {
+        // Smart case
+        NSRange uppercaseRange = [ query rangeOfCharacterFromSet:
+                [NSCharacterSet uppercaseLetterCharacterSet] ];
+        if (uppercaseRange.location == NSNotFound) {
+            // query is all lowercase, so we perform case-insensitive search
+            return NO;
+        } else {
+            // query contains uppercase letters, so we perform case-sensitive 
+            // search.
+            return YES;
+        }
+    }
+}
+
 - (void) doQuery:(NSString*)query {
-    query = [query lowercaseString];
+
+    NSArray* queryTokens = [ self tokenizeQuery: query ];
+    BOOL isCaseSensitive = [ self getIsCaseSensitive: query ];
 
     self.filteredSortedChoices = [self.choices mutableCopy];
 
     // analyze (cache)
     for (SDChoice* choice in self.filteredSortedChoices)
-        [choice analyze: query];
+        [ choice analyze:queryTokens isCaseSensitive:isCaseSensitive ];
 
     if ([query length] >= 1) {
 
         // filter out non-matches
         for (SDChoice* choice in [self.filteredSortedChoices copy]) {
-            if (!choice.hasAllCharacters)
+            if (!choice.isMatchForQuery)
                 [self.filteredSortedChoices removeObject: choice];
         }
 
         // sort remainder
-        [self.filteredSortedChoices sortUsingComparator:^NSComparisonResult(SDChoice* a, SDChoice* b) {
-            if (a.score > b.score) return NSOrderedAscending;
-            if (a.score < b.score) return NSOrderedDescending;
-            return NSOrderedSame;
-        }];
+        if (SortMatches) {
+            [self.filteredSortedChoices sortUsingComparator:^NSComparisonResult(SDChoice* a, SDChoice* b) {
+                if (a.score > b.score) return NSOrderedAscending;
+                if (a.score < b.score) return NSOrderedDescending;
+                return NSOrderedSame;
+            }];
+        }
 
     }
 }
@@ -585,6 +730,13 @@ static NSString* ScriptAtList;
     // push choice back to start
     self.choice = 0;
     [self reflectChoice];
+
+    // if there's only one choice, and AutoSelectSingleChoice is enabled, pick
+    // this choice and exit the app
+    if (AutoSelectSingleChoice && [self.filteredSortedChoices count] == 1) {
+        self.choice = 0;
+        [self choose];
+    }
 }
 
 /******************************************************************************/
@@ -791,7 +943,7 @@ static NSString* Script(NSString* pathToScript, NSString* queryInput, NSString* 
 
     NSFileHandle* stdinHandle = [NSFileHandle fileHandleWithStandardInput];
     NSData* inputData = Password ? nil : [stdinHandle readDataToEndOfFile];
-    NSString* inputStrings = [[[NSString alloc] initWithData:inputData encoding:NSUTF8StringEncoding] stringByTrimmingCharactersInSet: [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSString* inputStrings = [[[NSString alloc] initWithData:inputData encoding:NSUTF8StringEncoding] stringByTrimmingCharactersInSet: [NSCharacterSet newlineCharacterSet]];
 
     if ([inputStrings length] == 0 && !AllowEmptyInput)
         return nil;
@@ -845,6 +997,10 @@ static void usage(const char* name) {
     printf(" -o           given a query, outputs results to standard output\n");
     printf(" -z           search matches symbols from beginning (instead of from end by weird default)\n");
     printf(" -a           rank early matches higher\n");
+    printf(" -1           if there's only one element, select it automatically\n");
+    printf(" -W           match words (rather than characters) from the query field\n");
+    printf(" -S           do not sort matches (ie, present them in the same order they appeared in the input)\n");
+    printf(" -C [i]       i = case-insensitive, I = case-sensitive, s = smart (case-sensitive if query contains uppercase characters, case-insensitive otherwise)\n");
     exit(0);
 }
 
@@ -856,6 +1012,26 @@ static void queryStdout(SDAppDelegate* delegate, const char* query) {
         printf("%s\n", [choice.raw UTF8String]);
 
     exit(0);
+}
+
+static CaseSpecification getSearchCase(const char *optarg, const char *name) {
+
+    if (strlen(optarg) != 1) {
+        usage(name);
+    }
+    
+    switch (*optarg) {
+        case 'i':
+            return INSENSITIVE;
+        case 'I':
+            return SENSITIVE;
+        case 's':
+            return SMART;
+        default:
+            usage(name);
+    }
+
+    return INSENSITIVE;
 }
 
 int main(int argc, const char * argv[]) {
@@ -878,6 +1054,10 @@ int main(int argc, const char * argv[]) {
         SDNumRows = 10;
         SDReturnStringOnMismatch = NO;
         SDPercentWidth = -1;
+        AutoSelectSingleChoice = NO;
+        MatchWords = NO;
+        SortMatches = YES;
+        SearchCase = INSENSITIVE;
         Password = NO;
 
         static SDAppDelegate* delegate;
@@ -885,7 +1065,7 @@ int main(int argc, const char * argv[]) {
         [NSApp setDelegate: delegate];
 
         int ch;
-        while ((ch = getopt(argc, (char**)argv, "lvyezaf:s:r:c:b:n:w:p:q:r:t:x:o:Phium")) != -1) {
+        while ((ch = getopt(argc, (char**)argv, "lvyezaf:s:r:c:b:n:w:p:q:r:t:x:o:Phium1WSC:")) != -1) {
             switch (ch) {
                 case 'i': SDReturnsIndex = YES; break;
                 case 'f': queryFontName = optarg; break;
@@ -908,6 +1088,10 @@ int main(int argc, const char * argv[]) {
                 case 'z': MatchFromBeginning = YES; break;
                 case 'a': ScoreFirstMatchedPosition = YES; break;
                 case 'o': queryStdout(delegate, optarg); break;
+                case '1': AutoSelectSingleChoice = YES; break;
+                case 'W': MatchWords = YES; break;
+                case 'S': SortMatches = NO; break;
+                case 'C': SearchCase = getSearchCase(optarg, argv[0]); break;
                 case '?':
                 case 'h':
                 default:
@@ -935,3 +1119,4 @@ int main(int argc, const char * argv[]) {
     }
     return 0;
 }
+
