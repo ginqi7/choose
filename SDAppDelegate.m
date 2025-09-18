@@ -680,34 +680,167 @@ static CaseSpecification SearchCase;
     }
 }
 
+NSString *decodeBase64(NSString *base64String) {
+  base64String =
+    [base64String stringByReplacingOccurrencesOfString:@"\\n" withString:@""];
+  NSData *decodedData = [[NSData alloc]
+                          initWithBase64EncodedString:base64String
+                                              options:NSDataBase64DecodingIgnoreUnknownCharacters];
+  if (!decodedData) {
+    NSLog(@"Error: Could not decode Base64 string: %@", base64String);
+    return @"";
+  }
+  NSString *decodedString =
+    [[NSString alloc] initWithData:decodedData encoding:NSUTF8StringEncoding];
+  if (!decodedString) {
+    NSLog(@"Error: Could not convert decoded data back to string with UTF8 "
+          @"encoding.");
+    return @"";
+  }
+  return decodedString;
+}
+
+NSDictionary *decodeJSON(NSString *jsonString) {
+  NSData *jsonData = [jsonString dataUsingEncoding:NSUTF8StringEncoding];
+  if (!jsonData) {
+    NSLog(@"Error: Could not convert string to NSData.");
+    return nil;
+  }
+  NSError *error = nil;
+  id jsonObject =
+    [NSJSONSerialization JSONObjectWithData:jsonData
+                                    options:NSJSONReadingMutableContainers
+                                      error:&error];
+  // 5. 检查解析结果和错误
+  if (error) {
+    NSLog(@"JSON Parsing Error: %@", error.localizedDescription);
+    NSLog(@"JSON Parsing Error: %@", jsonString);
+    return nil;
+  }
+  return (NSDictionary *)jsonObject;
+}
+
+//  SDChoice *choice = [[SDChoice alloc] initWithString:inputItem[@"raw"]];
+
+SDChoice *parseJSON(NSDictionary *jsonDict) {
+  SDChoice *choice = [[SDChoice alloc] initWithString:jsonDict[@"raw"]];
+  NSArray *indexes = jsonDict[@"indexes"];
+  for (NSDictionary *matchIndex in indexes) {
+    NSNumber *startIndexObject = matchIndex[@"start"];
+    NSNumber *endIndexObject = matchIndex[@"end"];
+    NSInteger startValue = [startIndexObject integerValue];
+    NSInteger endValue = [endIndexObject integerValue];
+    for (NSInteger i = startValue;
+         i < endValue && i < [choice.displayString length]; i++) {
+      [choice.indexSet addIndex:i];
+    }
+  }
+  return choice;
+}
+
+NSArray *parseOutput(NSString *output) {
+
+  NSMutableArray *choices = [NSMutableArray array];
+  NSString *decodedString = decodeBase64(output);
+  NSError *error = nil;
+  NSDictionary *jsonDict = decodeJSON(decodedString);
+  if (!jsonDict) {
+    return choices;
+  }
+
+  // 访问数据
+  NSArray *data = jsonDict[@"data"];
+  for (NSDictionary *item in data) {
+    SDChoice *choice = parseJSON(item);
+    [choices addObject:choice];
+  }
+  return [choices copy];
+}
+
+NSString *runShellCommand(NSString *command) {
+  NSTask *task = [[NSTask alloc] init];
+  NSPipe *outputPipe = [NSPipe pipe]; // 用于捕获标准输出
+  NSPipe *errorPipe = [NSPipe pipe];  // 用于捕获标准错误
+
+  // 设置要执行的 shell 解释器和参数
+  [task setLaunchPath:@"/bin/bash"];
+  [task setArguments:@[
+                       @"-c", command
+                      ]]; // "-c" 参数告诉 bash 执行后面的字符串命令
+
+  // 将任务的标准输出和标准错误重定向到管道
+  [task setStandardOutput:outputPipe];
+  [task setStandardError:errorPipe];
+
+  // 用于存储输出和错误信息的字符串
+  NSString *outputString = @"";
+  NSString *errorString = @"";
+
+  @try {
+    // 启动任务
+    [task launch];
+
+    // 等待任务完成
+    [task waitUntilExit];
+
+    // 从标准输出管道读取数据并转换为字符串
+    // 7. 读取标准输出
+    NSData *outputData =
+      [[outputPipe fileHandleForReading] readDataToEndOfFile];
+    outputString = [[NSString alloc] initWithData:outputData
+                                         encoding:NSUTF8StringEncoding];
+
+    // 从标准错误管道读取数据并转换为字符串
+    NSData *errorData = [[errorPipe fileHandleForReading] readDataToEndOfFile];
+    errorString =
+      [[NSString alloc] initWithData:errorData encoding:NSUTF8StringEncoding];
+
+    // 如果有错误信息，则打印到控制台
+    if (errorString && [errorString length] > 0) {
+      NSLog(@"Shell Command Error:\n%@", errorString);
+    }
+
+  } @catch (NSException *exception) {
+    NSLog(@"Error launching shell command: %@", exception);
+    outputString = [NSString
+                     stringWithFormat:@"Error executing command: %@", exception.reason];
+  }
+
+  // 返回标准输出
+  return outputString
+    ? [outputString
+                   stringByTrimmingCharactersInSet:
+          [NSCharacterSet whitespaceAndNewlineCharacterSet]]
+    : @"";
+}
+
+NSString *queryByEmacs(NSString *query, NSMutableArray *choices) {
+  NSMutableArray *rawValuesMutable =
+    [NSMutableArray arrayWithCapacity:choices.count];
+
+  for (SDChoice *choice in choices) {
+    NSString *text =
+      [NSString stringWithFormat:@"(cons \"%@\" \"%@\")",
+                choice.displayString, choice.raw];
+    [rawValuesMutable addObject:text];
+  }
+  NSString *longString = [rawValuesMutable componentsJoinedByString:@" "];
+  NSString *command = [NSString
+                        stringWithFormat:
+                          @"/opt/homebrew/bin/emacsclient -s ~/.emacs.d/server/server --eval "
+                        @"'(emacs-choose-all-completion \"%@\" (list %@) nil nil)'",
+                        query, longString];
+  // NSLog(@"Command is %@", command);
+  return runShellCommand(command);
+}
 - (void) doQuery:(NSString*)query {
 
-    NSArray* queryTokens = [ self tokenizeQuery: query ];
-    BOOL isCaseSensitive = [ self getIsCaseSensitive: query ];
-
+    query = [query lowercaseString];
     self.filteredSortedChoices = [self.choices mutableCopy];
 
-    // analyze (cache)
-    for (SDChoice* choice in self.filteredSortedChoices)
-        [ choice analyze:queryTokens isCaseSensitive:isCaseSensitive ];
-
     if ([query length] >= 1) {
-
-        // filter out non-matches
-        for (SDChoice* choice in [self.filteredSortedChoices copy]) {
-            if (!choice.isMatchForQuery)
-                [self.filteredSortedChoices removeObject: choice];
-        }
-
-        // sort remainder
-        if (SortMatches) {
-            [self.filteredSortedChoices sortUsingComparator:^NSComparisonResult(SDChoice* a, SDChoice* b) {
-                if (a.score > b.score) return NSOrderedAscending;
-                if (a.score < b.score) return NSOrderedDescending;
-                return NSOrderedSame;
-            }];
-        }
-
+        NSString *result = queryByEmacs(query, self.filteredSortedChoices);
+        self.filteredSortedChoices = parseOutput(result);
     }
 }
 
